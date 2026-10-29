@@ -5,15 +5,19 @@ import {
   buildGoogleDriveMultipartBody,
   buildHtmlFromPages,
   buildMarkdownFromPages,
+  buildPdfEngineAssetUrls,
   chunkBase64String,
+  computeSafeCanvasRenderScale,
   detectWatermarkCandidates,
   ensurePdfExtension,
   extractCitedPageNumbers,
   findGlobalSearchMatches,
   formatFileSize,
   mapGoogleDriveFileToMeta,
+  normalizePdfBinaryBytes,
   parsePageRange,
   reassembleBase64Chunks,
+  resolveTextMarkupBounds,
   sanitizeDocumentPayload,
 } from './pdfPureLogic';
 import { PageTextData } from '../types/pdfStudio';
@@ -334,5 +338,95 @@ test('localDocumentIntelligence answers Hinglish & English PDF questions, summar
   assert.ok(rewritten.revisedText.includes('do not'));
   assert.ok(rewritten.revisedText.includes('receive'));
 });
+
+test('resolveTextMarkupBounds snaps single clicks, 0-height horizontal sweeps, and multi-line drags to PDF text spans', () => {
+  const sampleSpans = [
+    {
+      id: 'line_1',
+      pageNumber: 1,
+      str: '1. Executive Summary',
+      x: 0.1,
+      y: 0.2,
+      width: 0.35,
+      height: 0.024,
+      fontSize: 14,
+      angleDeg: 0,
+    },
+    {
+      id: 'line_2',
+      pageNumber: 1,
+      str: 'Project Horizon establishes a unified document pipeline.',
+      x: 0.1,
+      y: 0.24,
+      width: 0.65,
+      height: 0.02,
+      fontSize: 11,
+      angleDeg: 0,
+    },
+  ];
+
+  // 1. Single click on heading highlights the entire heading span cleanly
+  const singleClick = resolveTextMarkupBounds({ x: 0.18, y: 0.21 }, { x: 0.18, y: 0.21 }, sampleSpans);
+  assert.equal(singleClick.length, 1);
+  assert.equal(singleClick[0].text, '1. Executive Summary');
+  assert.ok(singleClick[0].width >= 0.35);
+  assert.ok(singleClick[0].height >= 0.024);
+
+  // 2. Horizontal sweep with zero vertical movement (dy = 0) snaps to line height
+  const horizontalSweep = resolveTextMarkupBounds({ x: 0.15, y: 0.25 }, { x: 0.45, y: 0.25 }, sampleSpans);
+  assert.equal(horizontalSweep.length, 1);
+  assert.ok(Math.abs(horizontalSweep[0].x - 0.15) < 0.005);
+  assert.ok(Math.abs(horizontalSweep[0].width - 0.3) < 0.01);
+  assert.ok(horizontalSweep[0].height >= 0.02);
+
+  // 3. Multi-line drag produces 2 clean per-line highlight bands
+  const multiLine = resolveTextMarkupBounds({ x: 0.12, y: 0.205 }, { x: 0.55, y: 0.255 }, sampleSpans);
+  assert.equal(multiLine.length, 2);
+
+  // 4. Scanned PDF with zero spans still creates a visible marker band on click or drag
+  const scannedClick = resolveTextMarkupBounds({ x: 0.5, y: 0.5 }, { x: 0.5, y: 0.5 }, []);
+  assert.equal(scannedClick.length, 1);
+  assert.ok(scannedClick[0].width >= 0.12);
+  assert.ok(scannedClick[0].height >= 0.02);
+});
+
+test('normalizePdfBinaryBytes, buildPdfEngineAssetUrls, and computeSafeCanvasRenderScale handle complex PDFs safely', () => {
+  // 1. Clean PDF header at byte 0
+  const cleanPdf = new TextEncoder().encode('%PDF-1.7\n1 0 obj\n<<>>\nendobj');
+  const normClean = normalizePdfBinaryBytes(cleanPdf);
+  assert.equal(normClean.isPdf, true);
+  assert.equal(normClean.headerOffset, 0);
+  assert.equal(normClean.bytes.byteLength, cleanPdf.byteLength);
+
+  // 2. Portal / WhatsApp PDF with leading UTF-8 BOM + whitespace before %PDF-1.4
+  const prefixed = new Uint8Array([0xef, 0xbb, 0xbf, 0x0d, 0x0a, ...cleanPdf]);
+  const normPrefixed = normalizePdfBinaryBytes(prefixed);
+  assert.equal(normPrefixed.isPdf, true);
+  assert.equal(normPrefixed.headerOffset, 5);
+  assert.equal(new TextDecoder().decode(normPrefixed.bytes.slice(0, 8)), '%PDF-1.7');
+
+  // 3. Non-PDF PNG image bytes
+  const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.equal(normalizePdfBinaryBytes(pngBytes).isPdf, false);
+
+  // 4. Engine asset URLs always include trailing slashes required by PDF.js v6
+  const urls = buildPdfEngineAssetUrls('https://example.vercel.app');
+  assert.equal(urls.wasmUrl, 'https://example.vercel.app/pdfjs/wasm/');
+  assert.equal(urls.iccUrl, 'https://example.vercel.app/pdfjs/iccs/');
+  assert.equal(urls.cMapUrl, 'https://example.vercel.app/pdfjs/cmaps/');
+  assert.equal(urls.standardFontDataUrl, 'https://example.vercel.app/pdfjs/standard_fonts/');
+
+  // 5. Standard A4/Letter page on 1x monitor gets >= 2x HiDPI supersampling for crisp graphics
+  const crispScale = computeSafeCanvasRenderScale(612, 792, 1.1, 1);
+  assert.equal(crispScale, 2.2);
+
+  // 6. Massive 5000x4000pt flex banner / CAD blueprint clamps safely within browser canvas limits
+  const bannerScale = computeSafeCanvasRenderScale(5000, 4000, 2.0, 2);
+  assert.ok(5000 * bannerScale <= 8192);
+  assert.ok(4000 * bannerScale <= 8192);
+  assert.ok(5000 * bannerScale * (4000 * bannerScale) <= 20_000_001);
+});
+
+
 
 

@@ -34,7 +34,9 @@ import {
 } from './types/pdfStudio';
 import {
   detectWatermarkCandidates,
+  ensurePdfExtension,
   formatFileSize,
+  normalizePdfBinaryBytes,
 } from './utils/pdfPureLogic';
 import {
   addWatermarkOverlayStream,
@@ -47,7 +49,10 @@ import {
   loadPdfProxy,
   removeWatermarksFromPdfBytes,
 } from './utils/pdfOperations';
-import { triggerBrowserDownload } from './utils/formatConverter';
+import {
+  convertExternalFilesToPdf,
+  triggerBrowserDownload,
+} from './utils/formatConverter';
 import {
   deleteLocalDocument,
   deletePdfFromGoogleDrive,
@@ -70,6 +75,7 @@ import { WatermarkStudioModal } from './components/WatermarkStudioModal';
 import { SignaturePadModal } from './components/SignaturePadModal';
 import { GoogleSignInButton } from './components/GoogleSignInButton';
 import { DriveActionModal, DriveModalState } from './components/DriveActionModal';
+import { PdfPasswordModal } from './components/PdfPasswordModal';
 
 const SAMPLE_DOC_ID = 'doc_project_horizon_sample';
 
@@ -116,12 +122,19 @@ export default function App() {
     span: ExtractedTextSpan;
   } | null>(null);
 
-  // Status Banner & Drag Drop
+  // Status Banner, Password Unlock & Drag Drop
   const [statusBanner, setStatusBanner] = useState<{
     type: 'info' | 'error';
     message: string;
   } | null>(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [pendingPasswordPrompt, setPendingPasswordPrompt] = useState<{
+    meta: StudioDocumentMeta;
+    bytes: Uint8Array;
+    preserveAnnotations?: PdfAnnotation[];
+    incorrectAttempt: boolean;
+  } | null>(null);
+  const [isUnlockingPdf, setIsUnlockingPdf] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const activeProxyRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
@@ -166,9 +179,31 @@ export default function App() {
   const mountPdfIntoEngine = useCallback(
     async (
       meta: StudioDocumentMeta,
-      bytes: Uint8Array,
-      preserveAnnotations?: PdfAnnotation[]
+      rawInputBytes: Uint8Array,
+      preserveAnnotations?: PdfAnnotation[],
+      password?: string
     ) => {
+      const normalized = normalizePdfBinaryBytes(rawInputBytes);
+      const bytes = normalized.isPdf ? normalized.bytes : rawInputBytes;
+
+      let proxy: pdfjsLib.PDFDocumentProxy;
+      try {
+        proxy = await loadPdfProxy(bytes, password);
+      } catch (err) {
+        const errObj = err as { name?: string; code?: number; message?: string };
+        if (errObj?.name === 'PasswordException') {
+          setPendingPasswordPrompt({
+            meta,
+            bytes,
+            preserveAnnotations,
+            incorrectAttempt: Boolean(password),
+          });
+          setStatusBanner(null);
+          return;
+        }
+        throw err;
+      }
+
       if (activeProxyRef.current) {
         try {
           const prev = activeProxyRef.current as unknown as {
@@ -181,8 +216,8 @@ export default function App() {
         }
       }
 
-      const proxy = await loadPdfProxy(bytes);
       activeProxyRef.current = proxy;
+      setPendingPasswordPrompt(null);
 
       const updatedMeta: StudioDocumentMeta = {
         ...meta,
@@ -324,27 +359,48 @@ export default function App() {
     void persistAnnotationsUpdate(restored);
   };
 
-  // Upload arbitrary small or large PDF file
+  // Open any PDF (standard, CMYK/ICC, PDF/A, PDF/X, WhatsApp octet-stream, password-locked) or image file
   const handleLoadUploadedFile = async (file: File) => {
-    if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
-      setStatusBanner({
-        type: 'error',
-        message: 'Select a valid .pdf file (or use Format Converter -> JPG/TXT to PDF).',
-      });
-      return;
-    }
-
     setStatusBanner({ type: 'info', message: `Opening ${file.name}...` });
     try {
       const arrayBuf = await file.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuf);
+      const rawBytes = new Uint8Array(arrayBuf);
+      const pdfCheck = normalizePdfBinaryBytes(rawBytes);
+
+      let finalBytes = pdfCheck.bytes;
+      let finalTitle = ensurePdfExtension(file.name.slice(0, 236));
+
+      if (!pdfCheck.isPdf) {
+        const lowerName = file.name.toLowerCase();
+        const isConvertibleFile =
+          file.type.startsWith('image/') ||
+          /\.(png|jpe?g|webp|bmp|txt|md)$/i.test(lowerName);
+
+        if (isConvertibleFile) {
+          const converted = await convertExternalFilesToPdf([file]);
+          finalBytes = converted.pdfBytes;
+          finalTitle = converted.title;
+        } else if (
+          !lowerName.endsWith('.pdf') &&
+          file.type !== 'application/pdf' &&
+          file.type !== 'application/x-pdf'
+        ) {
+          setStatusBanner({
+            type: 'error',
+            message:
+              'Selected file is not a valid PDF or supported image (.pdf, .png, .jpg, .webp).',
+          });
+          return;
+        }
+      }
+
       const now = new Date().toISOString();
       const docId = `doc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       const newMeta: StudioDocumentMeta = {
         id: docId,
-        title: file.name.slice(0, 240),
+        title: finalTitle,
         pageCount: 1,
-        fileSizeBytes: bytes.byteLength,
+        fileSizeBytes: finalBytes.byteLength,
         chunkCount: 0,
         watermarkRemoved: false,
         annotations: [],
@@ -354,7 +410,7 @@ export default function App() {
         createdAtIso: now,
         updatedAtIso: now,
       };
-      await mountPdfIntoEngine(newMeta, bytes, []);
+      await mountPdfIntoEngine(newMeta, finalBytes, []);
       setActiveTab(ActiveWorkspaceTab.VIEWER);
       setStatusBanner(null);
     } catch (err) {
@@ -362,6 +418,27 @@ export default function App() {
         type: 'error',
         message: err instanceof Error ? err.message : 'Unable to parse PDF file.',
       });
+    }
+  };
+
+  const handleUnlockPasswordProtectedPdf = async (password: string) => {
+    if (!pendingPasswordPrompt) return;
+    setIsUnlockingPdf(true);
+    try {
+      await mountPdfIntoEngine(
+        pendingPasswordPrompt.meta,
+        pendingPasswordPrompt.bytes,
+        pendingPasswordPrompt.preserveAnnotations,
+        password
+      );
+      setActiveTab(ActiveWorkspaceTab.VIEWER);
+    } catch (err) {
+      setStatusBanner({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Unable to unlock PDF file.',
+      });
+    } finally {
+      setIsUnlockingPdf(false);
     }
   };
 
@@ -840,11 +917,11 @@ export default function App() {
       }}
       className="flex h-screen w-full overflow-hidden bg-slate-50 text-slate-900"
     >
-      {/* Hidden Global PDF File Picker */}
+      {/* Hidden Global PDF & High-Res Document Picker */}
       <input
         ref={fileInputRef}
         type="file"
-        accept="application/pdf,.pdf"
+        accept="application/pdf,application/x-pdf,.pdf,image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp"
         onChange={(e) => {
           const picked = e.target.files?.[0];
           e.target.value = '';
@@ -1313,6 +1390,15 @@ export default function App() {
         }}
         onConfirmDeleteFromDrive={handleConfirmDeleteFromDrive}
         onDeleteLocalOnly={handleDeleteLocalOnly}
+      />
+
+      <PdfPasswordModal
+        isOpen={Boolean(pendingPasswordPrompt)}
+        fileName={pendingPasswordPrompt?.meta.title || 'Protected_Document.pdf'}
+        incorrectAttempt={Boolean(pendingPasswordPrompt?.incorrectAttempt)}
+        isUnlocking={isUnlockingPdf}
+        onClose={() => setPendingPasswordPrompt(null)}
+        onSubmitPassword={(pwd) => void handleUnlockPasswordProtectedPdf(pwd)}
       />
     </div>
   );

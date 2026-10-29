@@ -11,6 +11,7 @@ import {
 import {
   applyPageOrganizerOperations,
   mergePdfDocuments,
+  startCrispPdfPageRender,
 } from '../utils/pdfOperations';
 
 interface PageOrganizerItem {
@@ -35,19 +36,18 @@ const PageThumbCanvas: React.FC<{
 
   useEffect(() => {
     let cancelled = false;
+    let cancelJob: (() => void) | null = null;
     async function paint() {
       try {
         const page = await pdfProxy.getPage(pageNumber);
         if (cancelled || !canvasRef.current) return;
-        const vp = page.getViewport({ scale: 0.32, rotation: (page.rotate + rotationDeltaDeg) % 360 });
-        const canvas = canvasRef.current;
-        canvas.width = Math.ceil(vp.width);
-        canvas.height = Math.ceil(vp.height);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
+        const vp = page.getViewport({
+          scale: 0.48,
+          rotation: (page.rotate + rotationDeltaDeg) % 360,
+        });
+        const job = startCrispPdfPageRender(page, canvasRef.current, vp);
+        cancelJob = job.cancel;
+        await job.promise;
       } catch {
         // ignore rapid unmount
       }
@@ -55,6 +55,7 @@ const PageThumbCanvas: React.FC<{
     void paint();
     return () => {
       cancelled = true;
+      cancelJob?.();
     };
   }, [pdfProxy, pageNumber, rotationDeltaDeg]);
 

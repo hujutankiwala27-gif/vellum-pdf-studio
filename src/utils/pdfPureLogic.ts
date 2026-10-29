@@ -1,6 +1,7 @@
 import {
   DetectedWatermarkCandidate,
   ExtractedTextSpan,
+  NormalizedPoint,
   PageTextData,
   PdfAnnotation,
   PdfSearchMatch,
@@ -586,4 +587,256 @@ export function mapGoogleDriveFileToMeta(file: RawGoogleDriveFile): StudioDocume
     updatedAtIso: updatedIso,
   };
 }
+
+export interface MarkupRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  text?: string;
+}
+
+/**
+ * Resolves user pointer gestures (single tap/click, single-line horizontal sweep,
+ * multi-line text drag, or freeform area drag) into clean normalized highlight/underline/strike boxes.
+ */
+export function resolveTextMarkupBounds(
+  start: NormalizedPoint,
+  end: NormalizedPoint,
+  pageSpans: ExtractedTextSpan[]
+): MarkupRect[] {
+  const dx = Math.abs(end.x - start.x);
+  const dy = Math.abs(end.y - start.y);
+  const minX = Math.min(start.x, end.x);
+  const maxX = Math.max(start.x, end.x);
+  const minY = Math.min(start.y, end.y);
+  const maxY = Math.max(start.y, end.y);
+
+  const horizontalSpans = pageSpans.filter(
+    (s) => s.str.trim().length > 0 && Math.abs(s.angleDeg || 0) < 8
+  );
+
+  // 1. Single Click / Tap: highlight the exact text span under the pointer (or place a clean marker dab on scanned pages)
+  if (dx < 0.012 && dy < 0.01) {
+    const padX = 0.008;
+    const padY = 0.006;
+    const hitSpan = horizontalSpans.find(
+      (s) =>
+        start.x >= s.x - padX &&
+        start.x <= s.x + s.width + padX &&
+        start.y >= s.y - padY &&
+        start.y <= s.y + Math.max(0.016, s.height) + padY
+    );
+
+    if (hitSpan) {
+      return [
+        {
+          x: Math.max(0, hitSpan.x - 0.002),
+          y: Math.max(0, hitSpan.y - 0.002),
+          width: Math.min(1 - hitSpan.x, Math.max(0.02, hitSpan.width + 0.004)),
+          height: Math.max(0.018, hitSpan.height + 0.004),
+          text: hitSpan.str,
+        },
+      ];
+    }
+
+    // Fallback when clicking a scanned PDF / image region with no embedded text spans
+    const dabW = 0.14;
+    const dabH = 0.022;
+    return [
+      {
+        x: Math.max(0, Math.min(1 - dabW, start.x - dabW / 2)),
+        y: Math.max(0, Math.min(1 - dabH, start.y - dabH / 2)),
+        width: dabW,
+        height: dabH,
+      },
+    ];
+  }
+
+  // 2. Drag / Sweep gesture: check if gesture intersects embedded PDF text spans
+  const verticalPad = dy < 0.015 ? 0.007 : 0.003;
+  const overlappingSpans = horizontalSpans.filter((s) => {
+    const spanTop = s.y;
+    const spanBottom = s.y + Math.max(0.016, s.height);
+    const spanCenterY = (spanTop + spanBottom) / 2;
+    const spanLeft = s.x;
+    const spanRight = s.x + s.width;
+
+    const overlapsY =
+      (spanCenterY >= minY - verticalPad && spanCenterY <= maxY + verticalPad) ||
+      (minY >= spanTop - verticalPad && maxY <= spanBottom + verticalPad);
+    const overlapsX = maxX >= spanLeft + 0.003 && minX <= spanRight - 0.003;
+    return overlapsY && overlapsX;
+  });
+
+  if (overlappingSpans.length > 0) {
+    // Group overlapping spans into visual text lines by Y proximity
+    const sortedByY = [...overlappingSpans].sort((a, b) => a.y - b.y || a.x - b.x);
+    const lineGroups: ExtractedTextSpan[][] = [];
+
+    for (const sp of sortedByY) {
+      const lastGroup = lineGroups[lineGroups.length - 1];
+      if (!lastGroup) {
+        lineGroups.push([sp]);
+      } else {
+        const refY = lastGroup[0].y;
+        const tol = Math.max(0.01, lastGroup[0].height * 0.65);
+        if (Math.abs(sp.y - refY) <= tol) {
+          lastGroup.push(sp);
+        } else {
+          lineGroups.push([sp]);
+        }
+      }
+    }
+
+    // Single-line sweep: snap Y and height to the exact text line while preserving user's exact horizontal X sweep!
+    if (lineGroups.length === 1) {
+      const group = lineGroups[0];
+      const lineTop = Math.min(...group.map((g) => g.y));
+      const lineBottom = Math.max(...group.map((g) => g.y + Math.max(0.016, g.height)));
+      const spanMinX = Math.min(...group.map((g) => g.x));
+      const spanMaxX = Math.max(...group.map((g) => g.x + g.width));
+      const clampedLeft = Math.max(spanMinX - 0.003, minX);
+      const clampedRight = Math.min(spanMaxX + 0.003, maxX);
+      const finalLeft = clampedRight - clampedLeft >= 0.012 ? clampedLeft : minX;
+      const finalWidth =
+        clampedRight - clampedLeft >= 0.012
+          ? clampedRight - clampedLeft
+          : Math.max(0.02, dx);
+
+      return [
+        {
+          x: Math.max(0, finalLeft),
+          y: Math.max(0, lineTop - 0.002),
+          width: Math.min(1 - finalLeft, finalWidth),
+          height: Math.max(0.018, lineBottom - lineTop + 0.004),
+          text: group.map((g) => g.str).join(' '),
+        },
+      ];
+    }
+
+    // Multi-line text selection: produce crisp per-line highlight bands
+    return lineGroups.map((group, idx) => {
+      const lineTop = Math.min(...group.map((g) => g.y));
+      const lineBottom = Math.max(...group.map((g) => g.y + Math.max(0.016, g.height)));
+      const groupMinX = Math.min(...group.map((g) => g.x));
+      const groupMaxX = Math.max(...group.map((g) => g.x + g.width));
+
+      const left = idx === 0 ? Math.max(groupMinX, minX) : groupMinX;
+      const right =
+        idx === lineGroups.length - 1 ? Math.min(groupMaxX, maxX) : groupMaxX;
+      const safeLeft = right > left + 0.01 ? left : groupMinX;
+      const safeRight = right > left + 0.01 ? right : groupMaxX;
+
+      return {
+        x: Math.max(0, safeLeft - 0.002),
+        y: Math.max(0, lineTop - 0.002),
+        width: Math.min(1 - safeLeft, Math.max(0.02, safeRight - safeLeft + 0.004)),
+        height: Math.max(0.018, lineBottom - lineTop + 0.004),
+        text: group.map((g) => g.str).join(' '),
+      };
+    });
+  }
+
+  // 3. Freeform drag over blank area, diagram, or scanned PDF image
+  const fallbackH = Math.max(0.02, dy);
+  const adjustedY = dy < 0.012 ? Math.max(0, minY - fallbackH / 2) : minY;
+  return [
+    {
+      x: minX,
+      y: adjustedY,
+      width: Math.max(0.02, dx),
+      height: fallbackH,
+    },
+  ];
+}
+
+/**
+ * Inspects the first 1024 bytes for the ISO 32000-1 `%PDF-` signature and strips any
+ * leading BOM, portal whitespace, or wrapper bytes so non-standard / WhatsApp / portal PDFs open cleanly.
+ */
+export function normalizePdfBinaryBytes(rawBytes: Uint8Array): {
+  bytes: Uint8Array;
+  isPdf: boolean;
+  headerOffset: number;
+} {
+  if (!rawBytes || rawBytes.byteLength < 5) {
+    return { bytes: rawBytes, isPdf: false, headerOffset: -1 };
+  }
+
+  const maxScan = Math.min(rawBytes.byteLength - 5, 1024);
+  for (let i = 0; i <= maxScan; i++) {
+    if (
+      rawBytes[i] === 0x25 && // '%'
+      rawBytes[i + 1] === 0x50 && // 'P'
+      rawBytes[i + 2] === 0x44 && // 'D'
+      rawBytes[i + 3] === 0x46 && // 'F'
+      rawBytes[i + 4] === 0x2d // '-'
+    ) {
+      if (i === 0) {
+        return { bytes: rawBytes, isPdf: true, headerOffset: 0 };
+      }
+      return {
+        bytes: rawBytes.slice(i),
+        isPdf: true,
+        headerOffset: i,
+      };
+    }
+  }
+
+  return { bytes: rawBytes, isPdf: false, headerOffset: -1 };
+}
+
+/**
+ * Builds trailing-slash-qualified asset factory URLs required by PDF.js v6 for:
+ * - QCMS WebAssembly ICC color management + OpenJPEG (JPEG2000) + JBIG2 decoders (`wasmUrl`)
+ * - CMYK SWOP / CGATS ICC color profile (`iccUrl`)
+ * - Packed Adobe CMaps for CID / multi-language / symbol fonts (`cMapUrl`)
+ * - Standard 14 PDF fallback fonts (`standardFontDataUrl`)
+ */
+export function buildPdfEngineAssetUrls(originBaseUrl: string): {
+  wasmUrl: string;
+  iccUrl: string;
+  cMapUrl: string;
+  standardFontDataUrl: string;
+} {
+  const cleanBase = (originBaseUrl || '/').replace(/\/+$/, '') + '/';
+  return {
+    wasmUrl: `${cleanBase}pdfjs/wasm/`,
+    iccUrl: `${cleanBase}pdfjs/iccs/`,
+    cMapUrl: `${cleanBase}pdfjs/cmaps/`,
+    standardFontDataUrl: `${cleanBase}pdfjs/standard_fonts/`,
+  };
+}
+
+/**
+ * Computes an ultra-crisp HiDPI canvas render scale (>= 2x supersampling even on 1x displays)
+ * while clamping maximum canvas dimensions (<= 8192px) and pixel area (<= 20M px) so massive
+ * CorelDRAW banners, A0 CAD blueprints, and poster PDFs never exceed browser canvas memory limits.
+ */
+export function computeSafeCanvasRenderScale(
+  baseWidthPt: number,
+  baseHeightPt: number,
+  zoomScale: number,
+  devicePixelRatio: number
+): number {
+  const safeW = Math.max(1, baseWidthPt || 612);
+  const safeH = Math.max(1, baseHeightPt || 792);
+  const safeZoom = Math.max(0.25, zoomScale || 1);
+  const hiDpiMultiplier = Math.min(3, Math.max(2, devicePixelRatio || 1));
+
+  let scale = safeZoom * hiDpiMultiplier;
+
+  const MAX_CANVAS_DIM_PX = 8192;
+  const MAX_CANVAS_AREA_PX = 20_000_000;
+
+  const maxScaleByWidth = MAX_CANVAS_DIM_PX / safeW;
+  const maxScaleByHeight = MAX_CANVAS_DIM_PX / safeH;
+  const maxScaleByArea = Math.sqrt(MAX_CANVAS_AREA_PX / (safeW * safeH));
+
+  scale = Math.min(scale, maxScaleByWidth, maxScaleByHeight, maxScaleByArea);
+  return Math.max(0.2, Number(scale.toFixed(4)));
+}
+
+
 

@@ -14,8 +14,13 @@ import {
   buildHtmlFromPages,
   buildMarkdownFromPages,
   buildWordCompatibleDocHtml,
+  computeSafeCanvasRenderScale,
 } from './pdfPureLogic';
-import { extractPagesTextData, loadPdfProxy } from './pdfOperations';
+import {
+  extractPagesTextData,
+  loadPdfProxy,
+  startCrispPdfPageRender,
+} from './pdfOperations';
 
 export interface ConversionOutput {
   blob: Blob;
@@ -59,18 +64,17 @@ export async function convertPdfBytesToFormat(params: {
       for (let i = 0; i < pageNumbers.length; i++) {
         const pageNum = pageNumbers[i];
         const page = await pdfProxy.getPage(pageNum);
-        const viewport = page.getViewport({ scale: imageDpiScale });
+        const baseVp = page.getViewport({ scale: 1 });
+        const safeScale = computeSafeCanvasRenderScale(
+          baseVp.width,
+          baseVp.height,
+          imageDpiScale,
+          1
+        );
+        const viewport = page.getViewport({ scale: safeScale });
         const canvas = document.createElement('canvas');
-        canvas.width = Math.ceil(viewport.width);
-        canvas.height = Math.ceil(viewport.height);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          throw new Error('Canvas 2D context unavailable.');
-        }
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+        await startCrispPdfPageRender(page, canvas, viewport).promise;
 
         const blob = await new Promise<Blob>((resolve, reject) => {
           canvas.toBlob(
@@ -257,6 +261,40 @@ export async function convertExternalFilesToPdf(files: File[]): Promise<{
       const img = await pdfDoc.embedJpg(buf);
       const page = pdfDoc.addPage([img.width, img.height]);
       page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+    } else if (
+      lower.endsWith('.webp') ||
+      lower.endsWith('.bmp') ||
+      file.type.startsWith('image/')
+    ) {
+      // Convert WebP / BMP / other browser-decodable raster graphics losslessly into sRGB PNG
+      const bitmapUrl = URL.createObjectURL(file);
+      try {
+        const decodedImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const el = new Image();
+          el.onload = () => resolve(el);
+          el.onerror = () => reject(new Error(`Unable to decode image ${file.name}`));
+          el.src = bitmapUrl;
+        });
+        const cnv = document.createElement('canvas');
+        cnv.width = Math.max(1, decodedImg.naturalWidth || decodedImg.width);
+        cnv.height = Math.max(1, decodedImg.naturalHeight || decodedImg.height);
+        const ctx = cnv.getContext('2d', { colorSpace: 'srgb' }) || cnv.getContext('2d');
+        if (!ctx) throw new Error('Canvas context unavailable for image conversion.');
+        ctx.drawImage(decodedImg, 0, 0);
+        const pngDataUrl = cnv.toDataURL('image/png');
+        const base64Part = pngDataUrl.split(',')[1] || '';
+        const pngBytes = Uint8Array.from(atob(base64Part), (c) => c.charCodeAt(0));
+        const embedded = await pdfDoc.embedPng(pngBytes);
+        const page = pdfDoc.addPage([embedded.width, embedded.height]);
+        page.drawImage(embedded, {
+          x: 0,
+          y: 0,
+          width: embedded.width,
+          height: embedded.height,
+        });
+      } finally {
+        URL.revokeObjectURL(bitmapUrl);
+      }
     } else {
       const rawText = new TextDecoder('utf-8').decode(buf);
       const lines = rawText.split(/\r?\n/);

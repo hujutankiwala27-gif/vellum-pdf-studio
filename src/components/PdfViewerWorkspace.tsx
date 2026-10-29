@@ -73,11 +73,12 @@ interface PdfViewerWorkspaceProps {
 }
 
 const COLOR_SWATCHES = [
-  { hex: '#FACC15', label: 'Amber Highlight' },
-  { hex: '#1D4ED8', label: 'Cobalt Blue' },
-  { hex: '#DC2626', label: 'Crimson Red' },
-  { hex: '#16A34A', label: 'Forest Green' },
-  { hex: '#0F172A', label: 'Slate Ink' },
+  { hex: '#FACC15', label: 'Yellow Highlight', bgClass: 'bg-yellow-300' },
+  { hex: '#4ADE80', label: 'Green Highlight', bgClass: 'bg-emerald-400' },
+  { hex: '#38BDF8', label: 'Sky Blue Highlight', bgClass: 'bg-sky-400' },
+  { hex: '#F472B6', label: 'Pink Highlight', bgClass: 'bg-pink-400' },
+  { hex: '#FB923C', label: 'Orange Highlight', bgClass: 'bg-orange-400' },
+  { hex: '#EF4444', label: 'Crimson Red', bgClass: 'bg-red-500' },
 ];
 
 export const PdfViewerWorkspace: React.FC<PdfViewerWorkspaceProps> = ({
@@ -126,6 +127,26 @@ export const PdfViewerWorkspace: React.FC<PdfViewerWorkspaceProps> = ({
 
   const [showLeftDrawer, setShowLeftDrawer] = useState<boolean>(false);
   const [leftDrawerTab, setLeftDrawerTab] = useState<'pages' | 'annotations'>('pages');
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+
+  const handleChooseColor = (hex: string) => {
+    setActiveColor(hex);
+    if (selectedAnnotationId) {
+      const targetAnn = annotations.find((a) => a.id === selectedAnnotationId);
+      if (targetAnn && targetAnn.type !== 'redact' && targetAnn.type !== 'watermark_mask') {
+        onUpdateAnnotation(selectedAnnotationId, { color: hex });
+        return;
+      }
+    }
+    if (
+      activeTool === AnnotationTool.SELECT ||
+      activeTool === AnnotationTool.REDACT ||
+      activeTool === AnnotationTool.WATERMARK_MASK ||
+      activeTool === AnnotationTool.SIGNATURE
+    ) {
+      onSelectTool(AnnotationTool.HIGHLIGHT);
+    }
+  };
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -355,27 +376,27 @@ export const PdfViewerWorkspace: React.FC<PdfViewerWorkspaceProps> = ({
             onChange={(e) => setReadingTheme(e.target.value as ReadingTheme)}
             className="rounded-md border border-slate-200 bg-slate-50 px-1.5 py-1 text-xs font-medium text-slate-700 focus:border-blue-700 focus:outline-none"
           >
-            <option value={ReadingTheme.LIGHT}>Paper</option>
+            <option value={ReadingTheme.LIGHT}>Original Color</option>
             <option value={ReadingTheme.SEPIA}>Sepia</option>
             <option value={ReadingTheme.DARK}>Dark</option>
             <option value={ReadingTheme.INVERT}>Invert</option>
           </select>
         </div>
 
-        {/* Center Zone: Annotation & Direct Edit Tools */}
-        <div className="flex items-center gap-0.5 shrink-0">
+        {/* Center Zone: Annotation, Highlighter & Always-Visible Color Palette */}
+        <div className="flex flex-wrap items-center gap-1 shrink-0">
           {[
-            { tool: AnnotationTool.SELECT, icon: MousePointer, label: 'Select' },
-            { tool: AnnotationTool.HIGHLIGHT, icon: Highlighter, label: 'Highlight' },
-            { tool: AnnotationTool.UNDERLINE, icon: Underline, label: 'Underline' },
-            { tool: AnnotationTool.STRIKETHROUGH, icon: Strikethrough, label: 'Strike' },
-            { tool: AnnotationTool.INK, icon: PenTool, label: 'Ink' },
-            { tool: AnnotationTool.TEXT_EDIT, icon: Type, label: 'Edit Text' },
-            { tool: AnnotationTool.NOTE, icon: MessageSquarePlus, label: 'Note' },
-            { tool: AnnotationTool.RECT, icon: Square, label: 'Shape' },
-            { tool: AnnotationTool.REDACT, icon: EyeOff, label: 'Redact' },
-            { tool: AnnotationTool.STAMP, icon: Stamp, label: 'Stamp' },
-          ].map(({ tool, icon: Icon, label }) => {
+            { tool: AnnotationTool.SELECT, icon: MousePointer, label: 'Select', showText: false },
+            { tool: AnnotationTool.HIGHLIGHT, icon: Highlighter, label: 'Highlight', showText: true },
+            { tool: AnnotationTool.UNDERLINE, icon: Underline, label: 'Underline', showText: false },
+            { tool: AnnotationTool.STRIKETHROUGH, icon: Strikethrough, label: 'Strike', showText: false },
+            { tool: AnnotationTool.INK, icon: PenTool, label: 'Draw', showText: false },
+            { tool: AnnotationTool.TEXT_EDIT, icon: Type, label: 'Edit Text', showText: false },
+            { tool: AnnotationTool.NOTE, icon: MessageSquarePlus, label: 'Note', showText: false },
+            { tool: AnnotationTool.RECT, icon: Square, label: 'Shape', showText: false },
+            { tool: AnnotationTool.REDACT, icon: EyeOff, label: 'Redact', showText: false },
+            { tool: AnnotationTool.STAMP, icon: Stamp, label: 'Stamp', showText: false },
+          ].map(({ tool, icon: Icon, label, showText }) => {
             const isActive = activeTool === tool;
             return (
               <button
@@ -384,21 +405,57 @@ export const PdfViewerWorkspace: React.FC<PdfViewerWorkspaceProps> = ({
                 title={label}
                 aria-label={label}
                 onClick={() => {
-                  onSelectTool(tool);
-                  if (tool === AnnotationTool.HIGHLIGHT && activeColor === '#0F172A') {
-                    setActiveColor('#FACC15');
+                  if (tool !== AnnotationTool.SELECT) {
+                    setSelectedAnnotationId(null);
                   }
+                  onSelectTool(tool);
                 }}
-                className={`inline-flex items-center gap-1 rounded-md p-1.5 text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
+                className={`inline-flex items-center gap-1 rounded-md ${
+                  showText ? 'px-2 py-1.5' : 'p-1.5'
+                } text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
                   isActive
                     ? 'bg-blue-700 text-white'
                     : 'text-slate-700 hover:bg-slate-100'
                 }`}
               >
                 <Icon className="h-3.5 w-3.5" />
+                {showText && <span>{label}</span>}
               </button>
             );
           })}
+
+          {/* Always-Visible Highlighter & Annotation Color Swatches + Custom Color Picker */}
+          <div
+            role="group"
+            aria-label="Highlight and annotation colors"
+            className="mx-0.5 flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-1.5 py-1"
+          >
+            {COLOR_SWATCHES.map((sw) => {
+              const isCurrent = activeColor.toLowerCase() === sw.hex.toLowerCase();
+              return (
+                <button
+                  key={sw.hex}
+                  type="button"
+                  title={sw.label}
+                  aria-label={sw.label}
+                  onClick={() => handleChooseColor(sw.hex)}
+                  className={`h-4 w-4 rounded-full border transition-transform ${sw.bgClass} ${
+                    isCurrent
+                      ? 'scale-125 border-slate-950 ring-2 ring-slate-900/30'
+                      : 'border-slate-300 hover:scale-110'
+                  }`}
+                />
+              );
+            })}
+            <input
+              type="color"
+              aria-label="Custom highlight color"
+              title="Pick any custom color"
+              value={activeColor}
+              onChange={(e) => handleChooseColor(e.target.value)}
+              className="h-4 w-5 cursor-pointer rounded border-0 bg-transparent p-0"
+            />
+          </div>
 
           {activeTool === AnnotationTool.STAMP && (
             <select
@@ -433,27 +490,6 @@ export const PdfViewerWorkspace: React.FC<PdfViewerWorkspaceProps> = ({
             <FileSignature className="h-3.5 w-3.5" />
             <span>Sign</span>
           </button>
-
-          {/* Contextual Swatches when an annotation tool using color is active */}
-          {activeTool !== AnnotationTool.SELECT &&
-            activeTool !== AnnotationTool.REDACT &&
-            activeTool !== AnnotationTool.WATERMARK_MASK &&
-            activeTool !== AnnotationTool.SIGNATURE && (
-              <div className="mx-0.5 flex items-center gap-1">
-                {COLOR_SWATCHES.map((sw) => (
-                  <button
-                    key={sw.hex}
-                    type="button"
-                    aria-label={sw.label}
-                    onClick={() => setActiveColor(sw.hex)}
-                    className={`h-3.5 w-3.5 rounded-full border transition-transform ${
-                      activeColor === sw.hex ? 'scale-125 border-slate-900' : 'border-slate-300'
-                    }`}
-                    style={{ backgroundColor: sw.hex }}
-                  />
-                ))}
-              </div>
-            )}
 
           {/* Undo / Redo */}
           <button
@@ -863,6 +899,8 @@ export const PdfViewerWorkspace: React.FC<PdfViewerWorkspaceProps> = ({
                   annotations={getAnnotationsForPage(pageNum)}
                   pageSearchMatches={matchesByPage.get(pageNum) || []}
                   activeSearchMatchId={activeSearchMatch?.id || null}
+                  selectedAnnotationId={selectedAnnotationId}
+                  onSelectAnnotation={setSelectedAnnotationId}
                   onAddAnnotation={onAddAnnotation}
                   onUpdateAnnotation={onUpdateAnnotation}
                   onDeleteAnnotation={onDeleteAnnotation}

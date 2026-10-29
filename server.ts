@@ -62,8 +62,20 @@ async function startServer() {
       }
     });
   } else {
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
+    app.use(
+      express.static(distPath, {
+        setHeaders(res, filePath) {
+          if (filePath.endsWith('.wasm')) {
+            res.setHeader('Content-Type', 'application/wasm');
+          }
+        },
+      })
+    );
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/pdfjs/') || req.path.startsWith('/assets/')) {
+        res.status(404).end();
+        return;
+      }
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

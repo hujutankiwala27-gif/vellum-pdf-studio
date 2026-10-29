@@ -1,6 +1,7 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfjsWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import {
+  BlendMode,
   PDFArray,
   PDFDocument,
   PDFName,
@@ -15,23 +16,127 @@ import {
   PageTextData,
   PdfAnnotation,
 } from '../types/pdfStudio';
+import {
+  buildPdfEngineAssetUrls,
+  normalizePdfBinaryBytes,
+} from './pdfPureLogic';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 
-export async function loadPdfProxy(bytes: Uint8Array): Promise<pdfjsLib.PDFDocumentProxy> {
+function resolveBrowserOriginBaseUrl(): string | null {
+  if (typeof window === 'undefined' || !window.location?.origin) {
+    return null;
+  }
+  const viteBase =
+    typeof import.meta !== 'undefined' && import.meta.env?.BASE_URL
+      ? import.meta.env.BASE_URL
+      : '/';
+  try {
+    return new URL(viteBase, window.location.origin).href;
+  } catch {
+    return `${window.location.origin}/`;
+  }
+}
+
+export async function loadPdfProxy(
+  bytes: Uint8Array,
+  password?: string
+): Promise<pdfjsLib.PDFDocumentProxy> {
+  const normalized = normalizePdfBinaryBytes(bytes);
+  const sourceBytes = normalized.isPdf ? normalized.bytes : bytes;
+
   // Always pass a fresh copy so PDF.js worker transfer never detaches the caller's Uint8Array
-  const cloned = new Uint8Array(bytes.length);
-  cloned.set(bytes);
+  const cloned = new Uint8Array(sourceBytes.length);
+  cloned.set(sourceBytes);
+
+  const originBase = resolveBrowserOriginBaseUrl();
+  const assetUrls = originBase ? buildPdfEngineAssetUrls(originBase) : {};
+
   const loadingTask = pdfjsLib.getDocument({
     data: cloned,
+    password: password || undefined,
     enableXfa: true,
+    useWasm: true,
+    useSystemFonts: true,
+    cMapPacked: true,
+    stopAtErrors: false,
+    maxImageSize: -1,
+    canvasMaxAreaInBytes: -1,
+    ...assetUrls,
   });
   return loadingTask.promise;
 }
 
 /**
- * Extracts text spans and normalized bounding coordinates for up to `maxScanPages` pages
- * in parallel batches so even huge 500-page PDFs remain fast and non-blocking.
+ * Renders a PDF page onto a pristine untouched offscreen staging canvas first so PDF.js v6
+ * initializes its native `{ alpha: false, willReadFrequently: true }` pixel pipeline for exact
+ * ICC/CMYK color management, luminosity soft masks, mesh gradients, and AcroForm/stamp appearances,
+ * then atomically blits the finished frame onto `targetCanvas` with zero flicker or canvas lock conflicts.
+ */
+export function startCrispPdfPageRender(
+  page: pdfjsLib.PDFPageProxy,
+  targetCanvas: HTMLCanvasElement,
+  viewport: pdfjsLib.PageViewport
+): { promise: Promise<void>; cancel: () => void } {
+  const pixelWidth = Math.max(1, Math.ceil(viewport.width));
+  const pixelHeight = Math.max(1, Math.ceil(viewport.height));
+
+  const stagingCanvas = document.createElement('canvas');
+  stagingCanvas.width = pixelWidth;
+  stagingCanvas.height = pixelHeight;
+
+  let cancelled = false;
+  const renderTask = page.render({
+    canvas: stagingCanvas,
+    viewport,
+    intent: 'display',
+    annotationMode: pdfjsLib.AnnotationMode.ENABLE,
+    background: 'rgb(255,255,255)',
+  });
+
+  const promise = renderTask.promise.then(() => {
+    if (cancelled) return;
+    targetCanvas.width = pixelWidth;
+    targetCanvas.height = pixelHeight;
+
+    let outCtx: CanvasRenderingContext2D | null = null;
+    try {
+      outCtx = targetCanvas.getContext('2d', {
+        alpha: false,
+        colorSpace: 'srgb',
+      });
+    } catch {
+      outCtx = targetCanvas.getContext('2d', { alpha: false });
+    }
+    if (!outCtx) {
+      outCtx = targetCanvas.getContext('2d');
+    }
+    if (!outCtx) return;
+
+    outCtx.imageSmoothingEnabled = true;
+    outCtx.imageSmoothingQuality = 'high';
+    outCtx.drawImage(stagingCanvas, 0, 0, pixelWidth, pixelHeight);
+    // Release staging backing memory immediately after blit
+    stagingCanvas.width = 0;
+    stagingCanvas.height = 0;
+  });
+
+  return {
+    promise,
+    cancel: () => {
+      cancelled = true;
+      try {
+        renderTask.cancel();
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
+
+/**
+ * Extracts text spans and normalized bounding coordinates (accounting for CropBox offsets
+ * and 0/90/180/270 page rotations via `pdfjsLib.Util.transform`) in parallel batches.
  */
 export async function extractPagesTextData(
   pdfProxy: pdfjsLib.PDFDocumentProxy,
@@ -58,23 +163,21 @@ export async function extractPagesTextData(
 
         textContent.items.forEach((rawItem, idx) => {
           if (!('str' in rawItem) || !rawItem.str) return;
-          const tx = rawItem.transform; // [scaleX, skewY, skewX, scaleY, translateX, translateY]
-          const scaleX = tx[0];
-          const skewY = tx[1];
-          const fontSize = Math.hypot(scaleX, skewY) || 11;
-          const angleRad = Math.atan2(skewY, scaleX);
+          // Transform from PDF user space (accounting for CropBox & page rotation) into top-left viewport space
+          const combinedTx = pdfjsLib.Util.transform(viewport.transform, rawItem.transform);
+          const fontHeightPx = Math.hypot(combinedTx[2], combinedTx[3]) || Math.hypot(combinedTx[0], combinedTx[1]) || 11;
+          const angleRad = Math.atan2(-combinedTx[1], combinedTx[0]);
           const angleDeg = (angleRad * 180) / Math.PI;
 
-          const pdfX = tx[4];
-          const pdfY = tx[5];
-          const itemWidthPt = rawItem.width || rawItem.str.length * fontSize * 0.52;
-          const itemHeightPt = rawItem.height || fontSize * 1.18;
+          const vx = combinedTx[4];
+          const vy = combinedTx[5];
+          const itemWidthPt = rawItem.width || rawItem.str.length * fontHeightPx * 0.52;
+          const itemHeightPt = rawItem.height || fontHeightPx * 1.18;
 
-          // Convert bottom-left PDF origin to top-left normalized 0..1 coordinates
-          const normX = Math.max(0, Math.min(0.98, pdfX / viewport.width));
+          const normX = Math.max(0, Math.min(0.98, vx / viewport.width));
           const normY = Math.max(
             0,
-            Math.min(0.98, (viewport.height - pdfY - itemHeightPt * 0.82) / viewport.height)
+            Math.min(0.98, (vy - itemHeightPt * 0.84) / viewport.height)
           );
           const normW = Math.min(1 - normX, Math.max(0.02, itemWidthPt / viewport.width));
           const normH = Math.min(1 - normY, Math.max(0.014, itemHeightPt / viewport.height));
@@ -87,13 +190,13 @@ export async function extractPagesTextData(
             y: normY,
             width: normW,
             height: normH,
-            fontSize,
+            fontSize: fontHeightPx,
             angleDeg,
           });
 
           linePieces.push({
-            y: Math.round((viewport.height - pdfY) / 6) * 6,
-            x: pdfX,
+            y: Math.round(vy / 6) * 6,
+            x: vx,
             str: rawItem.str,
           });
         });
@@ -332,14 +435,23 @@ export async function bakeAnnotationsIntoPdf(
   pdfBytes: Uint8Array,
   annotations: PdfAnnotation[]
 ): Promise<Uint8Array> {
+  const normalized = normalizePdfBinaryBytes(pdfBytes);
+  const cleanSourceBytes = normalized.isPdf ? normalized.bytes : pdfBytes;
+
   if (annotations.length === 0) {
-    return pdfBytes.slice();
+    return cleanSourceBytes.slice();
   }
 
-  const pdfDoc = await PDFDocument.load(pdfBytes.slice(), { ignoreEncryption: true });
+  const pdfDoc = await PDFDocument.load(cleanSourceBytes.slice(), {
+    ignoreEncryption: true,
+    updateMetadata: false,
+  });
   const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
   const pages = pdfDoc.getPages();
+
+  // Check whether document defines a print OutputIntent (e.g. PDF/X-4 CMYK)
+  const hasOutputIntents = Boolean(pdfDoc.catalog.get(PDFName.of('OutputIntents')));
 
   // Expand applyToAllPages watermark masks across all pages
   const globalMasks = annotations.filter((a) => a.type === 'watermark_mask' && a.applyToAllPages);
@@ -347,7 +459,11 @@ export async function bakeAnnotationsIntoPdf(
   for (let pIdx = 0; pIdx < pages.length; pIdx++) {
     const pageNum = pIdx + 1;
     const page = pages[pIdx];
-    const { width, height } = page.getSize();
+    const cropBox = page.getCropBox();
+    const originX = cropBox.x || 0;
+    const originY = cropBox.y || 0;
+    const width = cropBox.width || page.getSize().width;
+    const height = cropBox.height || page.getSize().height;
 
     const pageAnns = [
       ...globalMasks,
@@ -356,11 +472,27 @@ export async function bakeAnnotationsIntoPdf(
       ),
     ];
 
+    if (
+      pageAnns.length > 0 &&
+      !hasOutputIntents &&
+      !page.node.get(PDFName.of('Group'))
+    ) {
+      // Lock page transparency blending space to DeviceRGB when adding semi-transparent
+      // highlights/stamps so Acrobat/PDFium never shifts page colors into uncalibrated CMYK
+      const rgbTransparencyGroup = pdfDoc.context.obj({
+        Type: 'Group',
+        S: 'Transparency',
+        CS: 'DeviceRGB',
+        I: true,
+      });
+      page.node.set(PDFName.of('Group'), rgbTransparencyGroup);
+    }
+
     for (const ann of pageAnns) {
-      const pdfX = ann.x * width;
+      const pdfX = originX + ann.x * width;
       const boxW = Math.max(8, ann.width * width);
       const boxH = Math.max(8, ann.height * height);
-      const pdfY = height - ann.y * height - boxH;
+      const pdfY = originY + height - ann.y * height - boxH;
       const color = hexToRgbColor(ann.color);
 
       if (ann.type === 'highlight') {
@@ -370,7 +502,8 @@ export async function bakeAnnotationsIntoPdf(
           width: boxW,
           height: boxH,
           color,
-          opacity: 0.35,
+          opacity: 0.48,
+          blendMode: BlendMode.Multiply,
         });
       } else if (ann.type === 'underline') {
         page.drawLine({
@@ -416,8 +549,8 @@ export async function bakeAnnotationsIntoPdf(
           const p0 = ann.points[i - 1];
           const p1 = ann.points[i];
           page.drawLine({
-            start: { x: p0.x * width, y: height - p0.y * height },
-            end: { x: p1.x * width, y: height - p1.y * height },
+            start: { x: originX + p0.x * width, y: originY + height - p0.y * height },
+            end: { x: originX + p1.x * width, y: originY + height - p1.y * height },
             thickness: ann.strokeWidth || 2.2,
             color,
           });
@@ -426,8 +559,8 @@ export async function bakeAnnotationsIntoPdf(
         const fSize = ann.fontSize || 11;
         if (ann.coverBackground) {
           page.drawRectangle({
-            x: Math.max(0, pdfX - 2),
-            y: Math.max(0, pdfY - 2),
+            x: Math.max(originX, pdfX - 2),
+            y: Math.max(originY, pdfY - 2),
             width: Math.max(boxW + 6, ann.text.length * fSize * 0.54),
             height: boxH + 4,
             color: rgb(1, 1, 1),
@@ -438,7 +571,7 @@ export async function bakeAnnotationsIntoPdf(
           lines.forEach((line, lIdx) => {
             page.drawText(line, {
               x: pdfX,
-              y: height - ann.y * height - fSize - lIdx * (fSize * 1.25),
+              y: originY + height - ann.y * height - fSize - lIdx * (fSize * 1.25),
               size: fSize,
               font: fontRegular,
               color,
@@ -448,7 +581,7 @@ export async function bakeAnnotationsIntoPdf(
       } else if (ann.type === 'note') {
         page.drawRectangle({
           x: pdfX,
-          y: height - ann.y * height - 18,
+          y: originY + height - ann.y * height - 18,
           width: 18,
           height: 18,
           color: rgb(0.96, 0.62, 0.04),
@@ -456,7 +589,7 @@ export async function bakeAnnotationsIntoPdf(
         if (ann.text) {
           page.drawText(`[Note: ${ann.text.slice(0, 80)}]`, {
             x: pdfX + 22,
-            y: height - ann.y * height - 13,
+            y: originY + height - ann.y * height - 13,
             size: 8.5,
             font: fontBold,
             color: rgb(0.55, 0.32, 0.02),
@@ -466,7 +599,7 @@ export async function bakeAnnotationsIntoPdf(
         const label = ann.text.toUpperCase();
         const stampW = Math.max(95, label.length * 9 + 20);
         const stampH = 26;
-        const stampY = height - ann.y * height - stampH;
+        const stampY = originY + height - ann.y * height - stampH;
         page.drawRectangle({
           x: pdfX,
           y: stampY,
@@ -561,20 +694,8 @@ export async function renderPdfPageToDataUrl(
   const page = await pdfProxy.getPage(safePage);
   const viewport = page.getViewport({ scale });
   const canvas = document.createElement('canvas');
-  canvas.width = Math.ceil(viewport.width);
-  canvas.height = Math.ceil(viewport.height);
-  const ctx = canvas.getContext('2d');
-  if (!ctx) {
-    throw new Error('Unable to initialize canvas for PDF page capture.');
-  }
-  ctx.fillStyle = '#FFFFFF';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  await page.render({
-    canvasContext: ctx,
-    viewport,
-    canvas,
-  }).promise;
+  await startCrispPdfPageRender(page, canvas, viewport).promise;
 
   const mimeType = 'image/png';
   const dataUrl = canvas.toDataURL(mimeType);

@@ -10,7 +10,12 @@ import {
   ReadingTheme,
   StampPreset,
 } from '../types/pdfStudio';
-import { getThemeCanvasFilter } from '../utils/pdfPureLogic';
+import {
+  computeSafeCanvasRenderScale,
+  getThemeCanvasFilter,
+  resolveTextMarkupBounds,
+} from '../utils/pdfPureLogic';
+import { startCrispPdfPageRender } from '../utils/pdfOperations';
 
 interface VirtualizedPdfPageProps {
   pdfProxy: pdfjsLib.PDFDocumentProxy;
@@ -25,6 +30,8 @@ interface VirtualizedPdfPageProps {
   annotations: PdfAnnotation[];
   pageSearchMatches: PdfSearchMatch[];
   activeSearchMatchId: string | null;
+  selectedAnnotationId?: string | null;
+  onSelectAnnotation?: (id: string | null) => void;
   onAddAnnotation: (ann: PdfAnnotation) => void;
   onUpdateAnnotation: (id: string, patch: Partial<PdfAnnotation>) => void;
   onDeleteAnnotation: (id: string) => void;
@@ -45,6 +52,8 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
   annotations,
   pageSearchMatches,
   activeSearchMatchId,
+  selectedAnnotationId,
+  onSelectAnnotation,
   onAddAnnotation,
   onUpdateAnnotation,
   onDeleteAnnotation,
@@ -78,7 +87,13 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
     fontSize: number;
   } | null>(null);
 
-  const [selectedAnnId, setSelectedAnnId] = useState<string | null>(null);
+  const [localSelectedAnnId, setLocalSelectedAnnId] = useState<string | null>(null);
+  const selectedAnnId =
+    selectedAnnotationId !== undefined ? selectedAnnotationId : localSelectedAnnId;
+  const setSelectedAnnId = (id: string | null) => {
+    setLocalSelectedAnnId(id);
+    onSelectAnnotation?.(id);
+  };
 
   // Virtualized IntersectionObserver for large 500+ page PDFs
   useEffect(() => {
@@ -113,45 +128,39 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
     }
   }, [activeSearchMatchId, pageSearchMatches]);
 
-  // Render high-DPI PDF page onto canvas when near viewport
+  // Render high-DPI PDF page via untouched offscreen staging canvas for 100% faithful ICC/CMYK color & complex graphics
   useEffect(() => {
     let cancelled = false;
-    let renderTask: pdfjsLib.RenderTask | null = null;
+    let cancelRender: (() => void) | null = null;
 
     async function renderPage() {
       try {
         const page = await pdfProxy.getPage(pageNumber);
         if (cancelled) return;
+        const baseViewport = page.getViewport({ scale: 1 });
         const cssViewport = page.getViewport({ scale: zoomScale });
         setPageDimensions({
-          width: Math.round(cssViewport.width),
-          height: Math.round(cssViewport.height),
+          width: Math.max(1, Math.round(cssViewport.width)),
+          height: Math.max(1, Math.round(cssViewport.height)),
         });
 
         if (!isNearViewport || !canvasRef.current) return;
 
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const hiViewport = page.getViewport({ scale: zoomScale * dpr });
-        const canvas = canvasRef.current;
-        canvas.width = Math.ceil(hiViewport.width);
-        canvas.height = Math.ceil(hiViewport.height);
+        const safeRenderScale = computeSafeCanvasRenderScale(
+          baseViewport.width,
+          baseViewport.height,
+          zoomScale,
+          typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 2
+        );
+        const hiViewport = page.getViewport({ scale: safeRenderScale });
+        const activeJob = startCrispPdfPageRender(page, canvasRef.current, hiViewport);
+        cancelRender = activeJob.cancel;
+        await activeJob.promise;
 
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-        renderTask = page.render({
-          canvasContext: ctx,
-          viewport: hiViewport,
-          canvas,
-        });
-        await renderTask.promise;
         if (!cancelled) {
           setIsRendered(true);
         }
       } catch (err) {
-        // Ignore cancelled render tasks during rapid zoom
         if (!cancelled && err instanceof Error && !err.message.includes('Rendering cancelled')) {
           console.error(`Render error on page ${pageNumber}:`, err);
         }
@@ -162,46 +171,64 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
 
     return () => {
       cancelled = true;
-      if (renderTask) {
-        try {
-          renderTask.cancel();
-        } catch {
-          // ignore
-        }
-      }
+      cancelRender?.();
     };
   }, [pdfProxy, pageNumber, zoomScale, isNearViewport]);
 
   const getNormalizedPoint = (e: React.PointerEvent<HTMLDivElement>): NormalizedPoint => {
-    const rect = e.currentTarget.getBoundingClientRect();
+    const surface = e.currentTarget ?? containerRef.current;
+    if (!surface) {
+      return { x: 0, y: 0 };
+    }
+    const rect = surface.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+      return { x: 0, y: 0 };
+    }
     return {
       x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
       y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
     };
   };
 
-  const isDragBoxTool =
+  const isTextMarkupTool =
     activeTool === AnnotationTool.HIGHLIGHT ||
     activeTool === AnnotationTool.UNDERLINE ||
-    activeTool === AnnotationTool.STRIKETHROUGH ||
+    activeTool === AnnotationTool.STRIKETHROUGH;
+
+  const isDragBoxTool =
+    isTextMarkupTool ||
     activeTool === AnnotationTool.RECT ||
     activeTool === AnnotationTool.REDACT ||
     activeTool === AnnotationTool.WATERMARK_MASK;
 
   const handleOverlayPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.target !== e.currentTarget) return;
-    setSelectedAnnId(null);
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl?.closest('button, input, textarea')) {
+      return;
+    }
+    if (activeTool === AnnotationTool.SELECT && e.target !== e.currentTarget) {
+      return;
+    }
 
+    setSelectedAnnId(null);
     const pt = getNormalizedPoint(e);
 
     if (activeTool === AnnotationTool.INK) {
-      e.currentTarget.setPointerCapture(e.pointerId);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore synthetic pointer capture errors
+      }
       setInkPoints([pt]);
       return;
     }
 
     if (isDragBoxTool) {
-      e.currentTarget.setPointerCapture(e.pointerId);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore synthetic pointer capture errors
+      }
       setDragStart(pt);
       setDragCurrent(pt);
       return;
@@ -270,12 +297,13 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
   };
 
   const handleOverlayPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const pt = getNormalizedPoint(e);
     if (activeTool === AnnotationTool.INK && inkPoints.length > 0) {
-      setInkPoints((prev) => [...prev, getNormalizedPoint(e)]);
+      setInkPoints((prev) => [...prev, pt]);
       return;
     }
     if (isDragBoxTool && dragStart) {
-      setDragCurrent(getNormalizedPoint(e));
+      setDragCurrent(pt);
     }
   };
 
@@ -307,36 +335,66 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
     setInkPoints([]);
 
     if (isDragBoxTool && dragStart && dragCurrent) {
-      const x = Math.min(dragStart.x, dragCurrent.x);
-      const y = Math.min(dragStart.y, dragCurrent.y);
-      const width = Math.abs(dragCurrent.x - dragStart.x);
-      const height = Math.abs(dragCurrent.y - dragStart.y);
-
-      if (width > 0.01 || height > 0.008) {
-        const typeMap: Record<string, PdfAnnotation['type']> = {
+      if (isTextMarkupTool) {
+        const markupTypeMap: Record<string, PdfAnnotation['type']> = {
           [AnnotationTool.HIGHLIGHT]: 'highlight',
           [AnnotationTool.UNDERLINE]: 'underline',
           [AnnotationTool.STRIKETHROUGH]: 'strikethrough',
-          [AnnotationTool.RECT]: 'rect',
-          [AnnotationTool.REDACT]: 'redact',
-          [AnnotationTool.WATERMARK_MASK]: 'watermark_mask',
         };
-        onAddAnnotation({
-          id: `ann_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          pageNumber,
-          type: typeMap[activeTool] || 'highlight',
-          x,
-          y,
-          width: Math.max(0.02, width),
-          height: Math.max(0.015, height),
-          color: activeColor,
-          applyToAllPages: activeTool === AnnotationTool.WATERMARK_MASK,
-          createdAt: new Date().toISOString(),
+        const resolvedRects = resolveTextMarkupBounds(dragStart, dragCurrent, pageSpans);
+        const nowIso = new Date().toISOString();
+
+        resolvedRects.forEach((rect, idx) => {
+          const newId = `ann_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+          onAddAnnotation({
+            id: newId,
+            pageNumber,
+            type: markupTypeMap[activeTool] || 'highlight',
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            color: activeColor,
+            text: rect.text,
+            createdAt: nowIso,
+          });
         });
+      } else {
+        const x = Math.min(dragStart.x, dragCurrent.x);
+        const y = Math.min(dragStart.y, dragCurrent.y);
+        const width = Math.abs(dragCurrent.x - dragStart.x);
+        const height = Math.abs(dragCurrent.y - dragStart.y);
+
+        if (width > 0.01 || height > 0.008) {
+          const typeMap: Record<string, PdfAnnotation['type']> = {
+            [AnnotationTool.RECT]: 'rect',
+            [AnnotationTool.REDACT]: 'redact',
+            [AnnotationTool.WATERMARK_MASK]: 'watermark_mask',
+          };
+          const newId = `ann_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          onAddAnnotation({
+            id: newId,
+            pageNumber,
+            type: typeMap[activeTool] || 'rect',
+            x,
+            y,
+            width: Math.max(0.02, width),
+            height: Math.max(0.015, height),
+            color: activeColor,
+            applyToAllPages: activeTool === AnnotationTool.WATERMARK_MASK,
+            createdAt: new Date().toISOString(),
+          });
+        }
       }
       setDragStart(null);
       setDragCurrent(null);
     }
+  };
+
+  const handleOverlayPointerCancel = () => {
+    setInkPoints([]);
+    setDragStart(null);
+    setDragCurrent(null);
   };
 
   const commitInlineTextEdit = () => {
@@ -404,12 +462,50 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
         </div>
       )}
 
-      {/* High-DPI PDF Canvas */}
+      {/* High-DPI Color-Managed PDF Canvas (zero CSS filter in Original Color mode) */}
       <canvas
         ref={canvasRef}
-        style={{ filter: getThemeCanvasFilter(readingTheme) }}
+        style={
+          readingTheme === ReadingTheme.LIGHT
+            ? undefined
+            : { filter: getThemeCanvasFilter(readingTheme) }
+        }
         className="block h-full w-full"
       />
+
+      {/* Direct Canvas-Blended Highlighter Ink Layer (no z-index wrapper so mix-blend-multiply blends directly with PDF text) */}
+      {annotations
+        .filter((a) => a.type === 'highlight')
+        .map((ann) => (
+          <div
+            key={`hl_fill_${ann.id}`}
+            data-testid="pdf-highlight-fill"
+            className="pointer-events-none absolute rounded-xs mix-blend-multiply"
+            style={{
+              left: `${ann.x * 100}%`,
+              top: `${ann.y * 100}%`,
+              width: `${ann.width * 100}%`,
+              height: `${ann.height * 100}%`,
+              backgroundColor: ann.color,
+              opacity: 0.55,
+            }}
+          />
+        ))}
+
+      {/* Live Highlighter Marker Preview while Dragging */}
+      {dragStart && dragCurrent && activeTool === AnnotationTool.HIGHLIGHT && (
+        <div
+          className="pointer-events-none absolute rounded-xs mix-blend-multiply"
+          style={{
+            left: `${Math.min(dragStart.x, dragCurrent.x) * 100}%`,
+            top: `${Math.max(0, Math.min(dragStart.y, dragCurrent.y) - 0.008) * 100}%`,
+            width: `${Math.max(0.015, Math.abs(dragCurrent.x - dragStart.x)) * 100}%`,
+            height: `${Math.max(0.02, Math.abs(dragCurrent.y - dragStart.y)) * 100}%`,
+            backgroundColor: activeColor,
+            opacity: 0.55,
+          }}
+        />
+      )}
 
       {/* Global Search Sub-Span Highlights Layer */}
       {pageSearchMatches.map((match) => {
@@ -503,30 +599,39 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
         onPointerDown={handleOverlayPointerDown}
         onPointerMove={handleOverlayPointerMove}
         onPointerUp={handleOverlayPointerUp}
-        className={`absolute inset-0 ${cursorClass}`}
+        onPointerCancel={handleOverlayPointerCancel}
+        className={`absolute inset-0 ${cursorClass} ${
+          activeTool !== AnnotationTool.SELECT ? 'touch-none' : ''
+        }`}
       >
-        {/* Active Drag Preview */}
-        {dragStart && dragCurrent && (
+        {/* Active Drag Preview for non-highlight box tools */}
+        {dragStart && dragCurrent && activeTool !== AnnotationTool.HIGHLIGHT && (
           <div
-            className="pointer-events-none absolute border border-blue-600 bg-blue-500/20"
+            className="pointer-events-none absolute border-2"
             style={{
               left: `${Math.min(dragStart.x, dragCurrent.x) * 100}%`,
               top: `${Math.min(dragStart.y, dragCurrent.y) * 100}%`,
-              width: `${Math.abs(dragCurrent.x - dragStart.x) * 100}%`,
-              height: `${Math.abs(dragCurrent.y - dragStart.y) * 100}%`,
+              width: `${Math.max(0.01, Math.abs(dragCurrent.x - dragStart.x)) * 100}%`,
+              height: `${Math.max(0.01, Math.abs(dragCurrent.y - dragStart.y)) * 100}%`,
+              borderColor: activeColor,
             }}
           />
         )}
 
-        {/* Rendered Annotations */}
+        {/* Rendered Annotations Interactive Controls */}
         {annotations
           .filter((a) => a.type !== 'ink')
           .map((ann) => {
             const isSelected = selectedAnnId === ann.id;
+            const allowBoxPointer =
+              activeTool === AnnotationTool.SELECT ||
+              ann.type === 'note' ||
+              ann.type === 'text_edit';
             return (
               <div
                 key={ann.id}
                 onClick={(e) => {
+                  if (!allowBoxPointer) return;
                   e.stopPropagation();
                   setSelectedAnnId(ann.id);
                   if (ann.type === 'text_edit') {
@@ -547,20 +652,17 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
                   left: `${ann.x * 100}%`,
                   top: `${ann.y * 100}%`,
                   width: ann.type === 'note' ? 'auto' : `${ann.width * 100}%`,
-                  minHeight: ann.type === 'note' ? 'auto' : `${ann.height * 100}%`,
+                  height: ann.type === 'note' ? 'auto' : `${ann.height * 100}%`,
                 }}
-                className={`group absolute ${isSelected ? 'ring-2 ring-blue-600 z-20' : 'z-10'}`}
+                className={`group absolute ${
+                  allowBoxPointer ? 'pointer-events-auto cursor-pointer' : 'pointer-events-none'
+                } ${isSelected ? 'ring-2 ring-blue-600 z-20 rounded-xs' : 'z-10'}`}
               >
-                {ann.type === 'highlight' && (
-                  <div
-                    className="h-full w-full mix-blend-multiply"
-                    style={{ backgroundColor: ann.color, opacity: 0.38, minHeight: `${ann.height * pageDimensions.height}px` }}
-                  />
-                )}
+                {ann.type === 'highlight' && <div className="h-full w-full" />}
                 {ann.type === 'underline' && (
                   <div
                     className="h-full w-full border-b-2"
-                    style={{ borderColor: ann.color, minHeight: `${ann.height * pageDimensions.height}px` }}
+                    style={{ borderColor: ann.color }}
                   />
                 )}
                 {ann.type === 'strikethrough' && (
@@ -640,8 +742,13 @@ export const VirtualizedPdfPage: React.FC<VirtualizedPdfPageProps> = ({
                   onClick={(e) => {
                     e.stopPropagation();
                     onDeleteAnnotation(ann.id);
+                    if (selectedAnnId === ann.id) {
+                      setSelectedAnnId(null);
+                    }
                   }}
-                  className="absolute -top-3 -right-3 hidden group-hover:flex h-6 w-6 items-center justify-center rounded-full border border-slate-200 bg-white text-red-600 shadow-sm hover:bg-red-50"
+                  className={`pointer-events-auto absolute -top-3 -right-3 ${
+                    isSelected ? 'flex' : 'hidden group-hover:flex'
+                  } h-6 w-6 items-center justify-center rounded-full border border-slate-200 bg-white text-red-600 shadow-sm hover:bg-red-50`}
                 >
                   <Trash2 className="h-3 w-3" />
                 </button>
